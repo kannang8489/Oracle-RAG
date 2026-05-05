@@ -1,0 +1,6 @@
+llama-index
+llama-index-readers-github
+llama-index-vector-stores-oracledb
+llama-index-embeddings-ollama
+oracledb
+python-dotenv

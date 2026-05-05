@@ -1,0 +1,1 @@
+Juarez Barbosa Junior is an Oracle Principal Developer Advocate. He is an expert in Java, Cloud Computing, and Artificial Intelligence. He frequently speaks at international conferences and contributes to open-source projects. He works closely with the developer community to help them adopt Oracle technologies such as Oracle Database 23ai, Spring Boot, and LangChain4j.
