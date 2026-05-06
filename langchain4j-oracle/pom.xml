@@ -39,7 +39,7 @@
       <artifactId>spring-boot-starter-web</artifactId>
     </dependency>
 
-    <!-- Oracle Database 23ai JDBC / UCP -->
+    <!-- Oracle Database 23ai JDBC / UCP / PKI (wallet support for ADB cloud) -->
     <dependency>
       <groupId>com.oracle.database.jdbc</groupId>
       <artifactId>ojdbc11</artifactId>
@@ -49,6 +49,22 @@
       <groupId>com.oracle.database.jdbc</groupId>
       <artifactId>ucp</artifactId>
       <version>23.4.0.24.05</version>
+    </dependency>
+    <!-- Required for mTLS wallet authentication with Oracle Autonomous Database -->
+    <dependency>
+      <groupId>com.oracle.database.security</groupId>
+      <artifactId>oraclepki</artifactId>
+      <version>23.4.0.24.05</version>
+    </dependency>
+    <dependency>
+      <groupId>com.oracle.database.security</groupId>
+      <artifactId>osdt_cert</artifactId>
+      <version>21.9.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.oracle.database.security</groupId>
+      <artifactId>osdt_core</artifactId>
+      <version>21.9.0.0</version>
     </dependency>
 
     <!-- Apache PDFBox dependency -->
@@ -92,18 +108,16 @@
       <version>${langchain.version}</version>
     </dependency>
 
-    <!-- In-process (ONNX) EmbeddingModel -->
+    <!-- In-process (ONNX) EmbeddingModel — kept for test scope only -->
     <dependency>
       <groupId>dev.langchain4j</groupId>
       <artifactId>langchain4j-embeddings-all-minilm-l6-v2-q</artifactId>
       <scope>test</scope>
       <version>${langchain.version}</version>
     </dependency>
-    <dependency>
-      <groupId>dev.langchain4j</groupId>
-      <artifactId>langchain4j-embeddings-all-minilm-l6-v2</artifactId>
-      <version>${langchain.version}</version>
-    </dependency>
+    <!-- NOTE: langchain4j-embeddings-all-minilm-l6-v2 is NOT needed at runtime.
+         Oracle 23ai handles all embeddings via DBMS_VECTOR.UTL_TO_EMBEDDING
+         using the ALL_MINILM_L6_V2 ONNX model loaded into the database. -->
 
     <!-- Ollama EmbeddingModel -->
     <dependency>
@@ -193,6 +207,13 @@
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-maven-plugin</artifactId>
         <version>${spring-boot.version}</version>
+        <executions>
+          <execution>
+            <goals>
+              <goal>repackage</goal>
+            </goals>
+          </execution>
+        </executions>
       </plugin>
       <plugin>
         <groupId>org.codehaus.mojo</groupId>

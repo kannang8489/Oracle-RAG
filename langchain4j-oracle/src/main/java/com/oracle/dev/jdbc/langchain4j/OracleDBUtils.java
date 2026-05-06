@@ -1,44 +1,3 @@
-/*
-  Copyright (c) 2024, Oracle and/or its affiliates.
-
-  This software is dual-licensed to you under the Universal Permissive License
-  (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl or Apache License
-  2.0 as shown at http://www.apache.org/licenses/LICENSE-2.0. You may choose
-  either license.
-
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
-/*
-  Copyright (c) 2024, Oracle and/or its affiliates.
-
-  This software is dual-licensed to you under the Universal Permissive License
-  (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl or Apache License
-  2.0 as shown at http://www.apache.org/licenses/LICENSE-2.0. You may choose
-  either license.
-
-  Licensed under the Apache License, Version 2.0 (the "License");
-  you may not use this file except in compliance with the License.
-  You may obtain a copy of the License at
-
-     https://www.apache.org/licenses/LICENSE-2.0
-
-  Unless required by applicable law or agreed to in writing, software
-  distributed under the License is distributed on an "AS IS" BASIS,
-  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-  See the License for the specific language governing permissions and
-  limitations under the License.
-*/
-
 package com.oracle.dev.jdbc.langchain4j;
 
 import java.sql.Connection;
@@ -50,39 +9,65 @@ import io.github.cdimascio.dotenv.Dotenv;
 import oracle.ucp.jdbc.PoolDataSource;
 import oracle.ucp.jdbc.PoolDataSourceFactory;
 
+/**
+ * Oracle 23ai Autonomous Database connection utility.
+ *
+ * Uses JKS-based mTLS (truststore.jks + keystore.jks from the wallet folder).
+ * This is the most reliable approach for Java 21 without registering the
+ * Oracle PKI provider as a JVM security provider.
+ *
+ * Required .env variables:
+ *   DB_TNS_ALIAS       — TNS alias from tnsnames.ora  (e.g. rms_medium)
+ *   DB_WALLET_DIR      — Path to extracted wallet folder (forward slashes)
+ *   DB_WALLET_PASSWORD — Password set when downloading the wallet from OCI
+ *   DB_23AI_USERNAME   — Database username (e.g. ADMIN)
+ *   DB_23AI_PASSWORD   — Database password
+ */
 public class OracleDBUtils {
 
-  private static final Dotenv dotenv = Dotenv.configure().ignoreIfMissing().load();
+    private static final Dotenv dotenv = Dotenv.configure().ignoreIfMissing().load();
 
-  // JDBC CONNECTION DETAILS
-  private final static String URL = "jdbc:oracle:thin:@localhost:1521/FREEPDB1";
-  private final static String USERNAME = dotenv.get("DB_23AI_USERNAME");
-  private final static String PASSWORD = dotenv.get("DB_23AI_PASSWORD");
+    private static final String TNS_ALIAS       = dotenv.get("DB_TNS_ALIAS");
+    private static final String WALLET_DIR      = dotenv.get("DB_WALLET_DIR");
+    private static final String WALLET_PASSWORD = dotenv.get("DB_WALLET_PASSWORD");
+    private static final String USERNAME        = dotenv.get("DB_23AI_USERNAME");
+    private static final String PASSWORD        = dotenv.get("DB_23AI_PASSWORD");
 
-  private static PoolDataSource poolDataSource;
+    // JDBC URL: TNS alias resolved via TNS_ADMIN in the connection properties
+    private static final String URL =
+        "jdbc:oracle:thin:@" + TNS_ALIAS + "?TNS_ADMIN=" + WALLET_DIR;
 
-  public static synchronized DataSource getPooledDataSource() throws SQLException {
-    if (poolDataSource == null) {
-      // Create pool-enabled data source instance
-      poolDataSource = PoolDataSourceFactory.getPoolDataSource();
-      // set connection properties on the data source
-      poolDataSource.setConnectionFactoryClassName("oracle.jdbc.pool.OracleDataSource");
-      poolDataSource.setURL(URL);
-      poolDataSource.setUser(USERNAME);
-      poolDataSource.setPassword(PASSWORD);
-      // Configure pool properties with a Properties instance
-      Properties prop = new Properties();
-      prop.setProperty("oracle.jdbc.vectorDefaultGetObjectType", "String");
-      poolDataSource.setConnectionProperties(prop);
-      // Override any pool properties directly
-      poolDataSource.setInitialPoolSize(2);
-      poolDataSource.setMaxPoolSize(20);
+    private static PoolDataSource poolDataSource;
+
+    public static synchronized DataSource getPooledDataSource() throws SQLException {
+        if (poolDataSource == null) {
+            poolDataSource = PoolDataSourceFactory.getPoolDataSource();
+            poolDataSource.setConnectionFactoryClassName("oracle.jdbc.pool.OracleDataSource");
+            poolDataSource.setURL(URL);
+            poolDataSource.setUser(USERNAME);
+            poolDataSource.setPassword(PASSWORD);
+
+            Properties prop = new Properties();
+            // Required for Oracle 23ai VECTOR columns to be returned as String
+            prop.setProperty("oracle.jdbc.vectorDefaultGetObjectType", "String");
+            // JKS-based mTLS — uses truststore.jks and keystore.jks from wallet
+            prop.setProperty("javax.net.ssl.trustStore",         WALLET_DIR + "/truststore.jks");
+            prop.setProperty("javax.net.ssl.trustStorePassword", WALLET_PASSWORD);
+            prop.setProperty("javax.net.ssl.trustStoreType",     "JKS");
+            prop.setProperty("javax.net.ssl.keyStore",           WALLET_DIR + "/keystore.jks");
+            prop.setProperty("javax.net.ssl.keyStorePassword",   WALLET_PASSWORD);
+            prop.setProperty("javax.net.ssl.keyStoreType",       "JKS");
+            // Enforce server DN matching (required by ADB)
+            prop.setProperty("oracle.net.ssl_server_dn_match", "true");
+
+            poolDataSource.setConnectionProperties(prop);
+            poolDataSource.setInitialPoolSize(2);
+            poolDataSource.setMaxPoolSize(20);
+        }
+        return poolDataSource;
     }
-    return poolDataSource;
-  }
 
-  public static Connection getConnectionFromPooledDataSource() throws SQLException {
-    return getPooledDataSource().getConnection();
-  }
-
+    public static Connection getConnectionFromPooledDataSource() throws SQLException {
+        return getPooledDataSource().getConnection();
+    }
 }

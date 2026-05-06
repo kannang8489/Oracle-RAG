@@ -2,256 +2,294 @@ package com.oracle.dev.jdbc.langchain4j;
 
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.sql.Array;
+import java.sql.Clob;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.Map;
-import java.util.HashMap;
-import java.util.List;
+import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.stream.Collectors;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.stream.Collectors;
 
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
-import dev.langchain4j.data.document.Document;
-import dev.langchain4j.data.document.Metadata;
-import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.chat.ChatLanguageModel;
 import dev.langchain4j.model.input.Prompt;
 import dev.langchain4j.model.input.PromptTemplate;
 import dev.langchain4j.model.ollama.OllamaChatModel;
-import dev.langchain4j.model.ollama.OllamaEmbeddingModel;
-import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
-import dev.langchain4j.store.embedding.EmbeddingSearchResult;
 import jakarta.annotation.PostConstruct;
 
+/**
+ * Core RAG service.
+ *
+ * Vectorization strategy:
+ *   - Uses Oracle 23ai's built-in DBMS_VECTOR.UTL_TO_EMBEDDING with the
+ *     ONNX model loaded into the database (all_MiniLM_L6_v2).
+ *   - Vector similarity search uses Oracle's native VECTOR_DISTANCE function.
+ *   - No external embedding service (Ollama) is needed for embeddings.
+ *
+ * LLM strategy:
+ *   - Uses Ollama llama3 (local) for answer generation.
+ *   - LLM_MODEL env var can override the model name.
+ *
+ * Sources:
+ *   - ORACLE_VECTOR_STORE  — uploaded documents (PDF, TXT, CSV, JSON, MD)
+ *   - GITHUB_VECTOR_STORE  — GitHub repository code (managed by GitHubSearchAgent)
+ */
 @Service
 public class ChatService {
 
     private static final Logger logger = LoggerFactory.getLogger(ChatService.class);
 
-    private OllamaEmbeddingModel embeddingModel;
-    private OracleEmbeddingStore pdfEmbeddingStore;
-    private OracleEmbeddingStore githubEmbeddingStore;
+    // Oracle 23ai ONNX model name loaded into the DB via DBMS_VECTOR
+    // This is the model name used in DBMS_VECTOR.UTL_TO_EMBEDDING calls
+    private static final String ORACLE_EMBED_MODEL = "ALL_MINILM_L6_V2";
+
+    // Vector dimension for all_MiniLM_L6_v2 = 384
+    private static final int VECTOR_DIM = 384;
+
+    @Autowired
+    private GitHubSearchAgent gitHubSearchAgent;
+
     private ChatLanguageModel chatModel;
 
     @PostConstruct
     public void init() throws SQLException {
-        embeddingModel = OllamaEmbeddingModel.builder()
-            .baseUrl("http://localhost:11434")
-            .modelName("nomic-embed-text").build();
+        io.github.cdimascio.dotenv.Dotenv dotenv =
+            io.github.cdimascio.dotenv.Dotenv.configure().ignoreIfMissing().load();
 
-        pdfEmbeddingStore = new OracleEmbeddingStore(
-            OracleDBUtils.getPooledDataSource(), "ORACLE_VECTOR_STORE",
-            768, 95, OracleDistanceType.COSINE,
-            OracleIndexType.IVF, true, true, false, true);
-
-        githubEmbeddingStore = new OracleEmbeddingStore(
-            OracleDBUtils.getPooledDataSource(), "GITHUB_VECTOR_STORE_V",
-            768, 95, OracleDistanceType.COSINE,
-            OracleIndexType.IVF, false, false, false, true);
+        String ollamaUrl   = dotenv.get("OLLAMA_BASE_URL", "http://localhost:11434");
+        String ollamaModel = dotenv.get("LLM_MODEL", "llama3:latest");
 
         chatModel = OllamaChatModel.builder()
-            .baseUrl("http://localhost:11434")
-            .modelName("llama3.1")
+            .baseUrl(ollamaUrl)
+            .modelName(ollamaModel)
             .temperature(0.0)
             .timeout(java.time.Duration.ofMinutes(5))
             .build();
+
+        // Ensure vector store tables exist
+        ensureDocumentStoreTable();
+        logger.info("ChatService initialized — Oracle 23ai native embeddings, LLM={}", ollamaModel);
     }
 
+    // ── Table bootstrap ──────────────────────────────────────────────────────────
+
+    private void ensureDocumentStoreTable() throws SQLException {
+        try (Connection conn = OracleDBUtils.getConnectionFromPooledDataSource();
+             Statement stmt = conn.createStatement()) {
+            // ORACLE_VECTOR_STORE — documents uploaded via admin dashboard
+            stmt.executeUpdate("""
+                BEGIN
+                  EXECUTE IMMEDIATE 'CREATE TABLE ORACLE_VECTOR_STORE (
+                    id       VARCHAR2(36) DEFAULT SYS_GUID() PRIMARY KEY,
+                    content  CLOB,
+                    metadata JSON,
+                    embedding VECTOR(%d, FLOAT32)
+                  )';
+                EXCEPTION WHEN OTHERS THEN
+                  IF SQLCODE != -955 THEN RAISE; END IF;
+                END;
+                """.formatted(VECTOR_DIM));
+
+            // IVF vector index for fast ANN search
+            try {
+                stmt.executeUpdate("""
+                    CREATE VECTOR INDEX IF NOT EXISTS idx_doc_embedding
+                    ON ORACLE_VECTOR_STORE (embedding)
+                    ORGANIZATION NEIGHBOR PARTITIONS
+                    DISTANCE COSINE
+                    WITH TARGET ACCURACY 95
+                    PARAMETERS (TYPE IVF, NEIGHBOR PARTITIONS 10)
+                    """);
+            } catch (SQLException e) {
+                // Index may already exist — not fatal
+                logger.debug("Vector index creation skipped: {}", e.getMessage());
+            }
+
+            logger.info("ORACLE_VECTOR_STORE table ready (dim={})", VECTOR_DIM);
+        }
+    }
+
+    // ── Oracle 23ai native embedding via DBMS_VECTOR ─────────────────────────────
+
+    /**
+     * Calls Oracle's DBMS_VECTOR.UTL_TO_EMBEDDING to generate a vector
+     * for the given text using the ONNX model loaded in the database.
+     *
+     * Returns the embedding as a float array.
+     */
+    private float[] embedWithOracle(Connection conn, String text) throws SQLException {
+        // Truncate to 512 tokens worth of chars to stay within model limits
+        String truncated = text.length() > 2000 ? text.substring(0, 2000) : text;
+        String sql = """
+            SELECT DBMS_VECTOR.UTL_TO_EMBEDDING(
+                ?,
+                JSON('{"provider":"database","model":"%s"}')
+            ) FROM DUAL
+            """.formatted(ORACLE_EMBED_MODEL);
+
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, truncated);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    // VECTOR type comes back as a double[] via getObject
+                    double[] vec = rs.getObject(1, double[].class);
+                    float[] result = new float[vec.length];
+                    for (int i = 0; i < vec.length; i++) result[i] = (float) vec[i];
+                    return result;
+                }
+            }
+        }
+        throw new SQLException("DBMS_VECTOR.UTL_TO_EMBEDDING returned no result");
+    }
+
+    // ── Document ingestion ───────────────────────────────────────────────────────
+
     public void ingestFile(InputStream inputStream, String fileName) throws Exception {
-        String content = "";
-        
+        String content;
         if (fileName != null && fileName.toLowerCase().endsWith(".pdf")) {
-            try (PDDocument document = PDDocument.load(inputStream)) {
-                PDFTextStripper pdfStripper = new PDFTextStripper();
-                content = pdfStripper.getText(document);
+            try (PDDocument doc = PDDocument.load(inputStream)) {
+                content = new PDFTextStripper().getText(doc);
             }
         } else {
             content = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
         }
 
-        if (content != null && !content.trim().isEmpty()) {
-            Metadata metadata = new Metadata();
-            metadata.put("source", fileName);
-
-            // Split into heading-aware segments so each chunk carries its section context
-            List<TextSegment> segments = splitWithHeadingContext(content, fileName);
-            logger.info("Split '{}' into {} heading-aware chunks", fileName, segments.size());
-
-            // Embed and store all segments
-            List<dev.langchain4j.data.embedding.Embedding> embeddings =
-                embeddingModel.embedAll(segments).content();
-            pdfEmbeddingStore.addAll(embeddings, segments);
-
-            logger.info("Successfully ingested file: {} ({} chars, {} chunks)", fileName, content.length(), segments.size());
-        } else {
+        if (content == null || content.trim().isEmpty()) {
             throw new Exception("File content is empty.");
         }
-    }
 
-    /**
-     * Splits document text into chunks that each carry their nearest section heading
-     * as a prefix. This preserves structural context for policy/guideline documents
-     * that use Roman numerals, letter sections, and numbered subsections.
-     *
-     * Each chunk text becomes:  "[Section heading]\n\n[chunk body]"
-     * Each chunk metadata carries: source, section_heading, section_level
-     */
-    private List<TextSegment> splitWithHeadingContext(String content, String fileName) {
-        // Heading patterns ordered from broadest to most specific:
-        //   Roman numeral:  "I.", "II.", "III.", "IV." ...
-        //   Letter section: "A.", "B.", "C." ...
-        //   Numbered sub:   "1.", "2.", "3." ...
-        java.util.regex.Pattern headingPattern = java.util.regex.Pattern.compile(
-            "^\\s*(" +
-            "(?:I{1,3}|IV|V?I{0,3}|IX|X{0,3}(?:IX|IV|V?I{0,3}))\\.\\s+.+" + // Roman
-            "|[A-Z]\\.\\s+.+" +                                                  // Letter
-            "|\\d+\\.\\s+.+" +                                                   // Numbered
-            ")$",
-            java.util.regex.Pattern.MULTILINE
-        );
+        List<TextSegment> segments = splitWithHeadingContext(content, fileName);
+        logger.info("Ingesting '{}' — {} chunks", fileName, segments.size());
 
-        // Walk through lines, track current heading, accumulate body text
-        String[] lines = content.split("\n");
-        List<TextSegment> segments = new ArrayList<>();
+        try (Connection conn = OracleDBUtils.getConnectionFromPooledDataSource()) {
+            conn.setAutoCommit(false);
+            String upsert = """
+                MERGE INTO ORACLE_VECTOR_STORE t
+                USING (SELECT ? AS id FROM DUAL) s ON (t.id = s.id)
+                WHEN MATCHED THEN UPDATE SET t.content=?, t.metadata=?, t.embedding=?
+                WHEN NOT MATCHED THEN INSERT (id, content, metadata, embedding)
+                  VALUES (?, ?, ?, ?)
+                """;
+            try (PreparedStatement ps = conn.prepareStatement(upsert)) {
+                for (TextSegment seg : segments) {
+                    String id = UUID.randomUUID().toString();
+                    float[] vec = embedWithOracle(conn, seg.text());
+                    oracle.sql.VECTOR oraVec = oracle.sql.VECTOR.ofFloat32Values(vec);
+                    oracle.sql.json.OracleJsonObject meta = buildMetaJson(seg.metadata().toMap());
 
-        String currentHeading = "";
-        StringBuilder currentBody = new StringBuilder();
-        int chunkSize = 1500;   // characters per chunk
-        int overlap   = 300;    // overlap between consecutive chunks of the same section
-
-        for (String line : lines) {
-            java.util.regex.Matcher m = headingPattern.matcher(line);
-            if (m.find() && line.trim().length() > 3) {
-                // Flush accumulated body under the previous heading
-                if (currentBody.length() > 0) {
-                    flushChunks(segments, currentHeading, currentBody.toString(), fileName, chunkSize, overlap);
-                    currentBody.setLength(0);
+                    ps.setString(1, id);
+                    ps.setString(2, seg.text());
+                    ps.setObject(3, meta, oracle.jdbc.OracleType.JSON.getVendorTypeNumber());
+                    ps.setObject(4, oraVec, oracle.jdbc.OracleType.VECTOR.getVendorTypeNumber());
+                    ps.setString(5, id);
+                    ps.setString(6, seg.text());
+                    ps.setObject(7, meta, oracle.jdbc.OracleType.JSON.getVendorTypeNumber());
+                    ps.setObject(8, oraVec, oracle.jdbc.OracleType.VECTOR.getVendorTypeNumber());
+                    ps.addBatch();
                 }
-                currentHeading = line.trim();
-            } else {
-                currentBody.append(line).append("\n");
+                ps.executeBatch();
             }
+            conn.commit();
         }
-        // Flush the last section
-        if (currentBody.length() > 0) {
-            flushChunks(segments, currentHeading, currentBody.toString(), fileName, chunkSize, overlap);
-        }
-
-        return segments;
+        logger.info("Ingested '{}' — {} chunks stored in Oracle", fileName, segments.size());
     }
 
-    /** Breaks a section body into fixed-size chunks, each prefixed with the heading. */
-    private void flushChunks(List<TextSegment> segments, String heading,
-                              String body, String fileName, int chunkSize, int overlap) {
-        String prefix = heading.isEmpty() ? "" : heading + "\n\n";
-        int start = 0;
-        while (start < body.length()) {
-            int end = Math.min(start + chunkSize, body.length());
-            String chunkText = prefix + body.substring(start, end).trim();
-            if (!chunkText.isBlank()) {
-                Metadata meta = new Metadata();
-                meta.put("source", fileName);
-                meta.put("section_heading", heading);
-                segments.add(TextSegment.from(chunkText, meta));
-            }
-            if (end == body.length()) break;
-            start = end - overlap;  // step back by overlap for continuity
-        }
-    }
+    // ── RAG query ────────────────────────────────────────────────────────────────
 
     public Map<String, Object> askQuestionWithSources(String question) {
-        Embedding queryEmbedding = embeddingModel.embed(question).content();
+        List<GitHubSearchAgent.ScoredChunk> merged = new ArrayList<>();
 
-        EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest
-            .builder()
-            .queryEmbedding(queryEmbedding)
-            .maxResults(10)   // top 10 per store, then merge-rank down to best 8 total
-            .minScore(0.3)
-            .build();
+        try (Connection conn = OracleDBUtils.getConnectionFromPooledDataSource()) {
+            float[] queryVec = embedWithOracle(conn, question);
+            oracle.sql.VECTOR oraQueryVec = oracle.sql.VECTOR.ofFloat32Values(queryVec);
 
-        // ── Search PDF/document store ────────────────────────────────────────────
-        EmbeddingSearchResult<TextSegment> pdfResult = pdfEmbeddingStore.search(searchRequest);
+            // ── Search ORACLE_VECTOR_STORE (documents) ───────────────────────────
+            String docSql = """
+                SELECT content,
+                       JSON_VALUE(metadata, '$.source')          AS source,
+                       JSON_VALUE(metadata, '$.section_heading') AS heading,
+                       1 - VECTOR_DISTANCE(embedding, ?, COSINE) AS score
+                FROM ORACLE_VECTOR_STORE
+                ORDER BY score DESC
+                FETCH APPROXIMATE FIRST 10 ROWS ONLY WITH TARGET ACCURACY 95
+                """;
+            try (PreparedStatement ps = conn.prepareStatement(docSql)) {
+                ps.setObject(1, oraQueryVec, oracle.jdbc.OracleType.VECTOR.getVendorTypeNumber());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        double score = rs.getDouble("score");
+                        if (score >= 0.3) {
+                            merged.add(new GitHubSearchAgent.ScoredChunk(score, "document",
+                                rs.getString("content"),
+                                rs.getString("source"),
+                                rs.getString("heading")));
+                        }
+                    }
+                }
+            }
 
-        // ── Search GitHub store (graceful fallback if table missing) ─────────────
-        EmbeddingSearchResult<TextSegment> githubResult;
-        try {
-            githubResult = githubEmbeddingStore.search(searchRequest);
+            // ── Search GITHUB_VECTOR_STORE (repos) via GitHubSearchAgent ────────
+            List<GitHubSearchAgent.ScoredChunk> ghChunks =
+                gitHubSearchAgent.search(conn, oraQueryVec, 10);
+            merged.addAll(ghChunks);
+
         } catch (Exception e) {
-            logger.warn("GitHub vector store search failed: {}", e.getMessage());
-            githubResult = new EmbeddingSearchResult<>(List.of());
+            logger.error("Vector search failed: {}", e.getMessage(), e);
+            return Map.of("answer", "Search failed: " + e.getMessage(), "sources", List.of());
         }
 
-        // ── Merge and rank all matches by score descending, keep top 8 ──────────
-        // Tag each match with its store type so the LLM prompt is clear
-        record ScoredChunk(double score, String storeType, dev.langchain4j.store.embedding.EmbeddingMatch<TextSegment> match) {}
+        // Sort by score descending, keep top 8
+        merged.sort((a, b) -> Double.compare(b.score(), a.score()));
+        List<GitHubSearchAgent.ScoredChunk> topChunks =
+            merged.stream().limit(8).collect(Collectors.toList());
 
-        List<ScoredChunk> merged = new ArrayList<>();
-        pdfResult.matches().forEach(m -> merged.add(new ScoredChunk(m.score(), "document", m)));
-        githubResult.matches().forEach(m -> merged.add(new ScoredChunk(m.score(), "github", m)));
-        merged.sort((a, b) -> Double.compare(b.score(), a.score())); // highest score first
+        logger.info("Query '{}' → {} total chunks (top 8 used)",
+            question.substring(0, Math.min(60, question.length())), merged.size());
 
-        List<ScoredChunk> topChunks = merged.stream().limit(8).collect(Collectors.toList());
-
-        logger.info("Query '{}' → {} doc chunks, {} github chunks, {} merged top chunks",
-            question.substring(0, Math.min(60, question.length())),
-            pdfResult.matches().size(), githubResult.matches().size(), topChunks.size());
-
-        // ── Build context and collect sources ────────────────────────────────────
+        // ── Build context ────────────────────────────────────────────────────────
         LinkedHashSet<String> sources = new LinkedHashSet<>();
-        StringBuilder contextBuilder = new StringBuilder();
+        StringBuilder ctx = new StringBuilder();
 
-        for (ScoredChunk sc : topChunks) {
-            TextSegment seg = sc.match().embedded();
-            if (seg == null) continue;
-
-            String source = seg.metadata().getString("source");
-            String heading = seg.metadata().getString("section_heading");
+        for (GitHubSearchAgent.ScoredChunk sc : topChunks) {
             String label;
-
             if ("github".equals(sc.storeType())) {
-                label = source != null ? "GitHub [" + source + "]" : "GitHub Repository";
-                sources.add(label);
+                label = sc.source() != null ? "GitHub [" + sc.source() + "]" : "GitHub Repository";
             } else {
-                label = source != null ? "Document [" + source + "]" : "Internal Documents";
-                sources.add(source != null ? source : "Internal Documents");
+                label = sc.source() != null ? sc.source() : "Internal Documents";
             }
+            sources.add(label);
 
-            contextBuilder
-                .append("--- Source: ").append(label)
-                .append(" | Score: ").append(String.format("%.2f", sc.score()));
-            if (heading != null && !heading.isBlank()) {
-                contextBuilder.append(" | Section: ").append(heading);
+            ctx.append("--- Source: ").append(label)
+               .append(" | Score: ").append(String.format("%.2f", sc.score()));
+            if (sc.heading() != null && !sc.heading().isBlank()) {
+                ctx.append(" | Section: ").append(sc.heading());
             }
-            contextBuilder.append(" ---\n")
-                .append(seg.text())
-                .append("\n\n");
+            ctx.append(" ---\n").append(sc.content()).append("\n\n");
         }
 
-        String information = contextBuilder.toString().trim();
+        String information = ctx.toString().trim();
+        boolean hasDoc    = topChunks.stream().anyMatch(c -> "document".equals(c.storeType()));
+        boolean hasGithub = topChunks.stream().anyMatch(c -> "github".equals(c.storeType()));
 
-        // ── Prompt adapts based on what was actually found ────────────────────────
-        boolean hasDocContent    = topChunks.stream().anyMatch(c -> "document".equals(c.storeType()));
-        boolean hasGithubContent = topChunks.stream().anyMatch(c -> "github".equals(c.storeType()));
-
-        String contextDescription;
-        if (hasDocContent && hasGithubContent) {
-            contextDescription = "The context contains both policy/document content and GitHub code. Use both to give a complete answer.";
-        } else if (hasGithubContent) {
-            contextDescription = "The context contains GitHub code. Explain the business logic and behavior based on the code.";
-        } else if (hasDocContent) {
-            contextDescription = "The context contains policy/guideline documents. Answer based strictly on the document content.";
-        } else {
-            contextDescription = "No relevant context was found.";
-        }
+        String ctxDesc;
+        if (hasDoc && hasGithub)  ctxDesc = "The context contains both policy/document content and GitHub code. Use both to give a complete answer.";
+        else if (hasGithub)       ctxDesc = "The context contains GitHub code. Explain the business logic and behavior based on the code.";
+        else if (hasDoc)          ctxDesc = "The context contains policy/guideline documents. Answer based strictly on the document content.";
+        else                      ctxDesc = "No relevant context was found.";
 
         Prompt prompt = PromptTemplate.from("""
             You are an expert AI assistant. {{contextDescription}}
@@ -268,122 +306,178 @@ public class ChatService {
 
             Question: {{question}}
             """).apply(Map.of(
-                "contextDescription", contextDescription,
+                "contextDescription", ctxDesc,
                 "information", information.isEmpty() ? "No relevant content found." : information,
                 "question", question));
 
         String answer = chatModel.generate(prompt.toUserMessage()).content().text();
-
-        Map<String, Object> result = new HashMap<>();
-        result.put("answer", answer);
-        result.put("sources", new ArrayList<>(sources));
-        return result;
+        return Map.of("answer", answer, "sources", new ArrayList<>(sources));
     }
 
     public String askQuestion(String question) {
         return (String) askQuestionWithSources(question).get("answer");
     }
 
+    // ── Document management ──────────────────────────────────────────────────────
+
     public void clearAllDocuments() {
-        String truncateQuery = "TRUNCATE TABLE ORACLE_VECTOR_STORE";
-        try (Connection connection = OracleDBUtils.getPooledDataSource().getConnection();
-             PreparedStatement stmt = connection.prepareStatement(truncateQuery)) {
-            stmt.executeUpdate();
-            logger.info("Truncated ORACLE_VECTOR_STORE — all embeddings removed.");
+        try (Connection conn = OracleDBUtils.getConnectionFromPooledDataSource();
+             Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate("TRUNCATE TABLE ORACLE_VECTOR_STORE");
+            logger.info("Truncated ORACLE_VECTOR_STORE");
         } catch (SQLException e) {
-            logger.error("Error truncating vector store: " + e.getMessage(), e);
             throw new RuntimeException("Failed to clear all documents", e);
         }
     }
 
     public void deleteDocument(String sourceName) {
-        String deleteQuery = "DELETE FROM ORACLE_VECTOR_STORE WHERE json_value(metadata, '$.source') = ?";
-        try (Connection connection = OracleDBUtils.getPooledDataSource().getConnection();
-             PreparedStatement stmt = connection.prepareStatement(deleteQuery)) {
-            stmt.setString(1, sourceName);
-            int deleted = stmt.executeUpdate();
+        String sql = "DELETE FROM ORACLE_VECTOR_STORE WHERE JSON_VALUE(metadata, '$.source') = ?";
+        try (Connection conn = OracleDBUtils.getConnectionFromPooledDataSource();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, sourceName);
+            int deleted = ps.executeUpdate();
             logger.info("Deleted {} chunks for document: {}", deleted, sourceName);
         } catch (SQLException e) {
-            logger.error("Error deleting document: " + e.getMessage(), e);
             throw new RuntimeException("Failed to delete document: " + sourceName, e);
         }
     }
 
     public void reEmbedDocument(InputStream inputStream, String fileName) throws Exception {
-        // Step 1: remove all existing chunks for this document
         deleteDocument(fileName);
-        logger.info("Removed old embeddings for: {}", fileName);
-
-        // Step 2: re-ingest with fresh embeddings
         ingestFile(inputStream, fileName);
         logger.info("Re-embedded document: {}", fileName);
     }
 
     public List<Map<String, Object>> getIndexedDocuments() {
-        List<Map<String, Object>> documents = new ArrayList<>();
-        // In Oracle 23ai, to extract string from JSON we use json_value
-        String query = "SELECT json_value(metadata, '$.source') as source_name, COUNT(*) as chunk_count FROM ORACLE_VECTOR_STORE WHERE json_value(metadata, '$.source') IS NOT NULL GROUP BY json_value(metadata, '$.source') ORDER BY source_name";
-        
-        try (Connection connection = OracleDBUtils.getPooledDataSource().getConnection();
-             PreparedStatement stmt = connection.prepareStatement(query);
-             ResultSet rs = stmt.executeQuery()) {
-            
+        List<Map<String, Object>> docs = new ArrayList<>();
+        String sql = """
+            SELECT JSON_VALUE(metadata, '$.source') AS source_name,
+                   COUNT(*) AS chunk_count
+            FROM ORACLE_VECTOR_STORE
+            WHERE JSON_VALUE(metadata, '$.source') IS NOT NULL
+            GROUP BY JSON_VALUE(metadata, '$.source')
+            ORDER BY source_name
+            """;
+        try (Connection conn = OracleDBUtils.getConnectionFromPooledDataSource();
+             PreparedStatement ps = conn.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
             while (rs.next()) {
-                String sourceName = rs.getString("source_name");
-                if (sourceName != null && !sourceName.trim().isEmpty()) {
-                    Map<String, Object> doc = new HashMap<>();
-                    doc.put("name", sourceName);
-                    doc.put("chunks", rs.getInt("chunk_count"));
-                    doc.put("status", "Indexed");
-                    documents.add(doc);
+                String name = rs.getString("source_name");
+                if (name != null && !name.isBlank()) {
+                    docs.add(Map.of("name", name, "chunks", rs.getInt("chunk_count"), "status", "Indexed"));
                 }
             }
-            logger.info("Retrieved " + documents.size() + " indexed documents");
         } catch (SQLException e) {
-            logger.error("Error retrieving indexed documents: " + e.getMessage(), e);
+            logger.error("Error retrieving indexed documents: {}", e.getMessage());
         }
-        
-        return documents;
+        return docs;
     }
 
     public Map<String, Object> debugSearch(String question) {
-        Embedding queryEmbedding = embeddingModel.embed(question).content();
-        EmbeddingSearchRequest req = EmbeddingSearchRequest.builder()
-            .queryEmbedding(queryEmbedding)
-            .maxResults(5)
-            .minScore(0.3)
-            .build();
+        List<String> docMatches = new ArrayList<>();
+        List<String> ghMatches  = new ArrayList<>();
 
-        EmbeddingSearchResult<TextSegment> pdfResult = pdfEmbeddingStore.search(req);
-        EmbeddingSearchResult<TextSegment> githubResult;
-        try {
-            githubResult = githubEmbeddingStore.search(req);
+        try (Connection conn = OracleDBUtils.getConnectionFromPooledDataSource()) {
+            float[] queryVec = embedWithOracle(conn, question);
+            oracle.sql.VECTOR oraVec = oracle.sql.VECTOR.ofFloat32Values(queryVec);
+
+            String sql = """
+                SELECT content, JSON_VALUE(metadata,'$.source') AS src,
+                       JSON_VALUE(metadata,'$.section_heading') AS heading,
+                       1 - VECTOR_DISTANCE(embedding, ?, COSINE) AS score
+                FROM ORACLE_VECTOR_STORE
+                ORDER BY score DESC FETCH FIRST 5 ROWS ONLY
+                """;
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setObject(1, oraVec, oracle.jdbc.OracleType.VECTOR.getVendorTypeNumber());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String txt = rs.getString("content");
+                        docMatches.add(String.format("[DOC %.3f] section=%s | %s",
+                            rs.getDouble("score"), rs.getString("heading"),
+                            txt.substring(0, Math.min(120, txt.length()))));
+                    }
+                }
+            }
+
+            List<GitHubSearchAgent.ScoredChunk> ghResults =
+                gitHubSearchAgent.search(conn, oraVec, 5);
+            for (GitHubSearchAgent.ScoredChunk sc : ghResults) {
+                ghMatches.add(String.format("[GH %.3f] source=%s | %s",
+                    sc.score(), sc.source(),
+                    sc.content().substring(0, Math.min(120, sc.content().length()))));
+            }
         } catch (Exception e) {
-            githubResult = new EmbeddingSearchResult<>(List.of());
+            logger.error("Debug search failed: {}", e.getMessage());
         }
 
-        List<String> docMatches = pdfResult.matches().stream()
-            .map(m -> String.format("[DOC  %.3f] section=%s | %s",
-                m.score(),
-                m.embedded().metadata().getString("section_heading"),
-                m.embedded().text().substring(0, Math.min(120, m.embedded().text().length()))))
-            .collect(Collectors.toList());
+        return Map.of("doc_matches", docMatches, "github_matches", ghMatches,
+                      "total", docMatches.size() + ghMatches.size());
+    }
 
-        List<String> ghMatches = githubResult.matches().stream()
-            .map(m -> String.format("[GH   %.3f] source=%s | %s",
-                m.score(),
-                m.embedded().metadata().getString("source"),
-                m.embedded().text().substring(0, Math.min(120, m.embedded().text().length()))))
-            .collect(Collectors.toList());
+    // ── Text chunking ────────────────────────────────────────────────────────────
 
-        List<String> all = new ArrayList<>();
-        all.addAll(docMatches);
-        all.addAll(ghMatches);
+    private List<TextSegment> splitWithHeadingContext(String content, String fileName) {
+        java.util.regex.Pattern headingPattern = java.util.regex.Pattern.compile(
+            "^\\s*((?:I{1,3}|IV|V?I{0,3}|IX|X{0,3}(?:IX|IV|V?I{0,3}))\\.\\s+.+" +
+            "|[A-Z]\\.\\s+.+|\\d+\\.\\s+.+)$",
+            java.util.regex.Pattern.MULTILINE);
 
-        return Map.of(
-            "doc_matches", docMatches,
-            "github_matches", ghMatches,
-            "total", all.size()
-        );
+        String[] lines = content.split("\n");
+        List<TextSegment> segments = new ArrayList<>();
+        String currentHeading = "";
+        StringBuilder currentBody = new StringBuilder();
+        int chunkSize = 1500, overlap = 300;
+
+        for (String line : lines) {
+            java.util.regex.Matcher m = headingPattern.matcher(line);
+            if (m.find() && line.trim().length() > 3) {
+                if (currentBody.length() > 0) {
+                    flushChunks(segments, currentHeading, currentBody.toString(), fileName, chunkSize, overlap);
+                    currentBody.setLength(0);
+                }
+                currentHeading = line.trim();
+            } else {
+                currentBody.append(line).append("\n");
+            }
+        }
+        if (currentBody.length() > 0) {
+            flushChunks(segments, currentHeading, currentBody.toString(), fileName, chunkSize, overlap);
+        }
+        return segments;
+    }
+
+    private void flushChunks(List<TextSegment> segments, String heading,
+                              String body, String fileName, int chunkSize, int overlap) {
+        String prefix = heading.isEmpty() ? "" : heading + "\n\n";
+        int start = 0;
+        while (start < body.length()) {
+            int end = Math.min(start + chunkSize, body.length());
+            String chunkText = prefix + body.substring(start, end).trim();
+            if (!chunkText.isBlank()) {
+                dev.langchain4j.data.document.Metadata meta = new dev.langchain4j.data.document.Metadata();
+                meta.put("source", fileName);
+                meta.put("section_heading", heading);
+                segments.add(TextSegment.from(chunkText, meta));
+            }
+            if (end == body.length()) break;
+            start = end - overlap;
+        }
+    }
+
+    // ── Helper ───────────────────────────────────────────────────────────────────
+
+    private oracle.sql.json.OracleJsonObject buildMetaJson(Map<String, Object> map) {
+        oracle.sql.json.OracleJsonObject obj = new oracle.sql.json.OracleJsonFactory().createObject();
+        if (map == null) return obj;
+        for (Map.Entry<String, Object> e : map.entrySet()) {
+            Object v = e.getValue();
+            if (v instanceof String s)       obj.put(e.getKey(), s);
+            else if (v instanceof Integer i) obj.put(e.getKey(), i);
+            else if (v instanceof Double d)  obj.put(e.getKey(), d);
+            else if (v instanceof Boolean b) obj.put(e.getKey(), b);
+            else                             obj.put(e.getKey(), String.valueOf(v));
+        }
+        return obj;
     }
 }
